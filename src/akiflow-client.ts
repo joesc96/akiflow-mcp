@@ -351,6 +351,14 @@ interface V5SyncResponse<T> {
   has_next_page?: boolean;
 }
 
+interface V5MutationEnvelope<T> {
+  data?: T[] | T | null;
+  items?: T[] | T | null;
+  item?: T | null;
+  success?: boolean;
+  message?: string | null;
+}
+
 export class AkiflowClient {
   private refreshToken: string;
   private accessToken: string = "";
@@ -558,6 +566,54 @@ export class AkiflowClient {
     });
   }
 
+  private normalizeV5MutationResponse<T extends { id?: string }>(
+    response: T[] | T | V5MutationEnvelope<T> | null | undefined,
+  ): T[] {
+    if (!response) {
+      return [];
+    }
+
+    if (Array.isArray(response)) {
+      return response;
+    }
+
+    if (typeof response === "object") {
+      const envelope = response as V5MutationEnvelope<T>;
+
+      if (Array.isArray(envelope.data)) {
+        return envelope.data;
+      }
+      if (Array.isArray(envelope.items)) {
+        return envelope.items;
+      }
+      if (envelope.data && typeof envelope.data === "object") {
+        return [envelope.data];
+      }
+      if (envelope.item && typeof envelope.item === "object") {
+        return [envelope.item];
+      }
+      if (envelope.items && typeof envelope.items === "object") {
+        return [envelope.items];
+      }
+
+      if ("id" in response) {
+        return [response as T];
+      }
+    }
+
+    return [];
+  }
+
+  private async getTaskById(taskId: string): Promise<Task | null> {
+    const tasks = await this.syncV5Collection<Task>(
+      "tasks",
+      this.TASKS_URL,
+      (task) => !!task.deleted_at || !!task.trashed_at,
+    );
+
+    return tasks.find((task) => task.id === taskId) ?? null;
+  }
+
   private async refreshAkiCollection<T extends { id: string }>(
     key: AkiCacheKey,
     fetchPage: (cursor?: string) => Promise<AkiPaginatedResponse<T>>,
@@ -714,7 +770,12 @@ export class AkiflowClient {
       ...(task.listId && { listId: task.listId }),
     };
 
-    const result = await this.request<Task[]>("PATCH", this.TASKS_URL, [newTask]);
+    const response = await this.request<Task[] | Task | V5MutationEnvelope<Task>>(
+      "PATCH",
+      this.TASKS_URL,
+      [newTask],
+    );
+    const result = this.normalizeV5MutationResponse<Task>(response);
     await this.mergeV5Items<Task>(
       "tasks",
       result,
@@ -733,12 +794,19 @@ export class AkiflowClient {
       }
       this.validateTask(task);
     }
-    const result = await this.request<Task[]>("PATCH", this.TASKS_URL, tasks);
-    await this.mergeV5Items<Task>(
-      "tasks",
-      result,
-      (task) => !!task.deleted_at || !!task.trashed_at,
-    );
+    const response = await this.request<
+      Task[] | Task | V5MutationEnvelope<Task>
+    >("PATCH", this.TASKS_URL, tasks);
+    const result = this.normalizeV5MutationResponse<Task>(response);
+
+    if (result.length > 0) {
+      await this.mergeV5Items<Task>(
+        "tasks",
+        result,
+        (task) => !!task.deleted_at || !!task.trashed_at,
+      );
+    }
+
     return result;
   }
 
@@ -754,12 +822,22 @@ export class AkiflowClient {
    */
   async markTaskDone(taskId: string): Promise<Task[]> {
     const now = new Date().toISOString();
-    return this.updateTask({
+    await this.updateTask({
       id: taskId,
       done: true,
       done_at: now,
       global_updated_at: now,
     });
+
+    const task = await this.getTaskById(taskId);
+    if (!task) {
+      throw new Error(`Task not found after mark done: ${taskId}`);
+    }
+    if (!task.done) {
+      throw new Error(`Task was not marked done: ${taskId}`);
+    }
+
+    return [task];
   }
 
   /**
